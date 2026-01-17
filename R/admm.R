@@ -1,238 +1,288 @@
-#' Double-splitting ADMM for quantile regression
-#'
-#' @param X Design matrix (n x p)
-#' @param y Response vector (length n)
-#' @param lambda L1 penalty parameter
-#' @param max_iter Maximum ADMM iterations
-#' @param rho,phi ADMM parameters
-#' @param tau Quantile level in (0,1)
-#' @param e.rel,e.abs Relative/absolute tolerances
-#' @param M,G,K Splitting/acceleration settings
-#' @param Args Optional list of warm-starts: beta, z, w, eta
-#' @param beta_true Optional true beta for diagnostics
-#' @param idx_true Optional support set of true beta (indices of nonzeros)
-#'
-#' @return A list with elements
-#' \itemize{
-#'   \item beta.hat: estimated coefficient vector (length p)
-#'   \item iter: number of iterations used
-#'   \item err, FP, FN, size, P1, P2: diagnostics (NA if not provided true values)
-#' }
-#'
-#' @import MASS
-#' @import doParallel
-#' @import foreach
-#' @importFrom foreach %dopar% %do% foreach
-#' @importFrom MASS ginv
-#' @export
-admm_both <- function(X, y, lambda = 0, max_iter, rho = 1, tau,
-                      e.rel = 1e-3, e.abs = 1e-3, phi, M = 2, G = 2, K = 1,
-                      Args = NULL, beta_true = NULL, idx_true = NULL){
+# DS-ADMM solver with multiple stopping rules
 
-  p <- ncol(X); n <- nrow(X)
+admm_both_stop <- function(
+    X, y,
+    lambda = 0,
+    max_iter = 5000,
+    rho = 1.618,
+    tau = 0.5,
+    e.rel = 1e-3,
+    e.abs = 1e-3,
+    phi = 1.0,
+    M = 2,
+    G = 1,
+    K = 1,
+    stop_rule = c("residual", "objective", "beta", "support", "hybrid"),
+    epsF = 1e-6,
+    epsBeta = 1e-4,
+    delta_support = 1e-6,
+    L_support = 5,
+    penalize_intercept = FALSE,
+    min_iter = 10,
+    residual_gated = TRUE,
+    obj_scale = c("mean", "sum"),
+    freeze_phi = FALSE,
+    verbose = FALSE,
+    print_every = 50,
+    beta_start = NULL,
+    return_trace = FALSE,
+    trace_every = 1,
+    trace_max = 2000
+) {
+  stop_rule <- match.arg(stop_rule)
+  obj_scale <- match.arg(obj_scale)
 
-  # Matrix partitions
-  x.mg <- matsplitter(X, M, G)
-  y.m  <- matrix(y, ncol = M)
+  stopifnot(is.matrix(X), is.numeric(y), length(y) == nrow(X))
+  n <- nrow(X); p <- ncol(X)
+  stopifnot(n %% M == 0, p %% G == 0)
+
+  # Scale threshold by number of rows (N)
+  N_pairs_scale <- n
+
+  x.mg <- matsplit_mg(X, M, G)
+
+  nr <- n %/% M
+  nc <- p %/% G
+
+  ## y block split
+  y.m <- matrix(0, nrow = nr, ncol = M)
+  for (m in 1:M) {
+    r_idx <- ((m - 1) * nr + 1):(m * nr)
+    y.m[, m] <- y[r_idx]
+  }
 
   # Initialization
-  if (is.null(Args)){
-    z.m <- matrix(0, nrow = n/M, ncol = M)
-    beta <- matrix(0, nrow = p, ncol = M)
-    beta.mg <- matsplitter(beta, G, 1)
-    beta.g <- matrix(0, nrow = p/G, ncol = G)
-    w <- matrix(0, nrow = n, ncol = G)
-    w.mg <- matsplitter(w, M, 1)
-    gamma <- matrix(0, nrow = p, ncol = M)
-    gamma.g <- matsplitter(gamma, G, 1)
-    eta <- matrix(0, nrow = n, ncol = G)
-    eta.mg <- matsplitter(eta, M, 1)
-    theta.m <- matrix(0, nrow = n/M, ncol = M)
-  } else{
-    beta <- Args$beta
-    z.m  <- Args$z
-    w    <- Args$w
-    eta  <- Args$eta
-    beta.mg <- matsplitter(beta, G, 1)
-    beta.g  <- matrix(0, nrow = p/G, ncol = G)
-    w.mg    <- matsplitter(w, M, 1)
-    gamma   <- matrix(0, nrow = p, ncol = M)
-    gamma.g <- matsplitter(gamma, G, 1)
-    eta.mg  <- matsplitter(eta, M, 1)
-    theta.m <- matrix(0, nrow = n/M, ncol = M)
+  if (is.null(beta_start) || length(beta_start) != p) beta_start <- numeric(p)
+
+  beta.g <- matrix(beta_start, nrow = nc, ncol = G)
+
+  beta.mg <- vector("list", G)
+  for (g in 1:G) {
+    beta.mg[[g]] <- matrix(0, nrow = nc, ncol = M)
+    for (m in 1:M) beta.mg[[g]][, m] <- beta.g[, g]
   }
 
-  r_1 <- matsplitter(matrix(0, nrow = p, ncol = M), G, 1)
-  r_2 <- matsplitter(matrix(0, nrow = n, ncol = G), M, 1)
-  r_3 <- matrix(0, nrow = n/M, ncol = M)
-  abeta <- matsplitter(matrix(0, nrow = n, ncol = G), M, 1)
+  w.mg <- vector("list", M)
+  z.m <- matrix(0, nrow = nr, ncol = M)
 
-  # Inverse step (parallelized)
-  doParallel::registerDoParallel(M*G)
-  x.inv <- foreach::foreach (i=1:(M*G)) %dopar% {
-    MASS::ginv(t(x.mg[[i]]) %*% x.mg[[i]] + diag(ncol(x.mg[[i]])))
+  for (m in 1:M) {
+    w.mg[[m]] <- matrix(0, nrow = nr, ncol = G)
+    for (g in 1:G) {
+      w.mg[[m]][, g] <- as.numeric(x.mg[[m, g]] %*% beta.mg[[g]][, m])
+    }
+    z.m[, m] <- y.m[, m] - rowSums(w.mg[[m]])
   }
-  x.invnew <- matrix(x.inv, ncol = G)
 
-  # Residuals
-  r.norm <- 1; s.norm <- 1; e.primal <- 0; e.dual <- 0; t <- 1L
+  ## Dual variables
+  theta.m <- matrix(0, nrow = nr, ncol = M)
+  eta.mg <- vector("list", M)
+  for (m in 1:M) eta.mg[[m]] <- matrix(0, nrow = nr, ncol = G)
+  gamma.g <- vector("list", G)
+  for (g in 1:G) gamma.g[[g]] <- matrix(0, nrow = nc, ncol = M)
 
-  # ADMM loop
-  while ((r.norm > e.primal || s.norm > e.dual) && t < max_iter){
+  ## Precompute inverse
+  x.inv <- matrix(vector("list", M * G), nrow = M, ncol = G)
+  for (m in 1:M) for (g in 1:G) {
+    Xm <- x.mg[[m, g]]
+    x.inv[[m, g]] <- solve(crossprod(Xm) + diag(ncol(Xm)))
+  }
 
-    z.1 <- z.m; w.1 <- w.mg; eta.1 <- eta.mg
+  beta_vec_prev <- c(beta.g)
 
-    # beta.g
-    doParallel::registerDoParallel(G)
-    beta.g[,1:G] <- foreach::foreach(g=1:G, .combine=cbind) %dopar% {
-      u_vec <- rowMeans(beta.mg[[g]]) - (1/phi)*rowMeans(gamma.g[[g]])
-      a_vec <- (lambda)/(phi*M)
-      prox_beta(u_vec, a_vec)
+  obj_lad_l1 <- function(beta_vec) {
+    r <- as.numeric(y - X %*% beta_vec)
+    loss <- sum(abs(r))
+    pen_idx <- seq_along(beta_vec)
+    if (!penalize_intercept && length(beta_vec) >= 1) pen_idx <- pen_idx[-1]
+    pen <- lambda * sum(abs(beta_vec[pen_idx]))
+    loss + pen
+  }
+
+  F_prev <- obj_lad_l1(beta_vec_prev)
+  if (!is.finite(F_prev)) F_prev <- 0
+
+  A_prev <- support_set(beta_vec_prev, delta = delta_support, penalize_intercept = penalize_intercept)
+  stable_ct <- 0L
+  stop_iter <- NA_integer_
+  stop_reason <- NA_character_
+
+  # trace placeholder
+  trace <- NULL
+
+  prox_abs_phi <- function(v, phi, scale_factor) {
+    thr <- 1 / (phi * scale_factor)
+    sign(v) * pmax(abs(v) - thr, 0)
+  }
+
+  ## Initialize loop-updated quantities so the return list is always defined.
+  r.norm <- NA_real_
+  s.norm <- NA_real_
+  C_pri  <- NA_real_
+  C_dual <- NA_real_
+  delta_F <- NA_real_
+  delta_beta <- NA_real_
+
+  t <- 1L
+  while (t < max_iter) {
+    z_prev <- c(z.m)
+
+    ## (1) beta.mg update
+    for (m in 1:M) for (g in 1:G) {
+      Xm <- x.mg[[m, g]]
+      rhs <- crossprod(Xm, w.mg[[m]][, g] - eta.mg[[m]][, g] / phi) +
+        beta.g[, g] + gamma.g[[g]][, m] / phi
+      beta.mg[[g]][, m] <- as.numeric(x.inv[[m, g]] %*% rhs)
     }
 
-    # beta.mg
-    doParallel::registerDoParallel(G)
-    beta.mg <- foreach::foreach(g=1:G) %dopar% {
-      foreach::foreach(m=1:M, .combine=cbind) %do% {
-        x.invnew[m,g][[1]] %*%
-          (beta.g[,g] - 1/phi * t(x.mg[m,g][[1]]) %*% eta.mg[[m]][,g] +
-             t(x.mg[m,g][[1]]) %*% w.mg[[m]][,g] + 1/phi * gamma.g[[g]][,m])
+    ## (2) beta.g update
+    for (g in 1:G) {
+      u_vec <- rowMeans(beta.mg[[g]]) - (1 / phi) * rowMeans(gamma.g[[g]])
+      a_val <- lambda / (phi * M)
+      beta.g[, g] <- prox_beta(u_vec, a_val)
+    }
+
+    ## (3) z.m update
+    for (m in 1:M) {
+      v <- y.m[, m] - rowSums(w.mg[[m]]) - theta.m[, m] / phi
+      z.m[, m] <- prox_abs_phi(v, phi, scale_factor = N_pairs_scale)
+    }
+
+    ## (4) w.mg update (exact with duals)
+    for (m in 1:M) {
+      A_mg <- matrix(0, nrow = nr, ncol = G)
+      for (g in 1:G) {
+        A_mg[, g] <- as.numeric(x.mg[[m, g]] %*% beta.mg[[g]][, m]) +
+          eta.mg[[m]][, g] / phi
+      }
+
+      B_m <- y.m[, m] - z.m[, m] - theta.m[, m] / phi
+      sum_A <- rowSums(A_mg)
+      common_term <- (sum_A - B_m) / (1 + G)
+
+      for (g in 1:G) {
+        w.mg[[m]][, g] <- A_mg[, g] - common_term
       }
     }
 
-    # w.mg intermediate
-    doParallel::registerDoParallel(G)
-    for (m in 1:M){
-      for (g in 1:G){
-        abeta[[m]][,g] <- x.mg[m,g][[1]] %*% beta.mg[[g]][,m]
-      }
+    ## (5) Multipliers update
+    for (m in 1:M) {
+      theta.m[, m] <- theta.m[, m] + rho * phi * (z.m[, m] + rowSums(w.mg[[m]]) - y.m[, m])
+    }
+    for (m in 1:M) for (g in 1:G) {
+      Xm <- x.mg[[m, g]]
+      eta.mg[[m]][, g] <- eta.mg[[m]][, g] + rho * phi * (as.numeric(Xm %*% beta.mg[[g]][, m]) - w.mg[[m]][, g])
+    }
+    for (g in 1:G) for (m in 1:M) {
+      gamma.g[[g]][, m] <- gamma.g[[g]][, m] + rho * phi * (beta.g[, g] - beta.mg[[g]][, m])
     }
 
-    w.mg <- foreach::foreach(m=1:M) %do% {
-      foreach::foreach(g=1:G, .combine=cbind) %dopar% {
-        1/G * (y.m[,m] - z.m[,m] + G * x.mg[m,g][[1]] %*% beta.mg[[g]][,m] -
-                 rowSums(abeta[[m]]))
-      }
+    ## (6) Residuals
+    r1 <- 0
+    for (g in 1:G) for (m in 1:M) r1 <- r1 + l2norm(beta.mg[[g]][, m] - beta.g[, g])
+    r2 <- 0
+    for (m in 1:M) r2 <- r2 + l2norm(z.m[, m] + rowSums(w.mg[[m]]) - y.m[, m])
+    r3 <- 0
+    for (m in 1:M) for (g in 1:G) {
+      Xm <- x.mg[[m, g]]
+      r3 <- r3 + l2norm(as.numeric(Xm %*% beta.mg[[g]][, m]) - w.mg[[m]][, g])
     }
-
-    # z.m
-    doParallel::registerDoParallel(M)
-    z.m[,1:M] <- foreach::foreach(m=1:M, .combine=cbind) %dopar% {
-      xi_vec <- y.m[,m] - rowSums(w.mg[[m]]) - (theta.m[,m]/phi)
-      alpha_vec <- 1/(n*phi/M)
-      prox_z(xi = xi_vec, alpha = alpha_vec, quan = tau)
-    }
-
-    # duals
-    for (g in 1:G){
-      for (m in 1:M){
-        gamma.g[[g]][,m] <- gamma.g[[g]][,m] + rho*phi*(-beta.mg[[g]][,m]+beta.g[,g])
-      }
-    }
-    for (m in 1:M){
-      theta.m[,m] <- theta.m[,m] + rho*phi*(z.m[,m] + rowSums(w.mg[[m]]) - y.m[,m])
-    }
-    for (m in 1:M){
-      for (g in 1:G){
-        eta.mg[[m]][,g] <- eta.mg[[m]][,g] +
-          rho*phi*(-w.mg[[m]][,g] + x.mg[m,g][[1]] %*% beta.mg[[g]][,m])
-      }
-    }
-
-    t <- t + 1L
-
-    # residuals
-    for (g in 1:G){
-      for (m in 1:M){
-        r_1[[g]][,m] <- -beta.mg[[g]][,m] + beta.g[,g]
-      }
-    }
-    for (m in 1:M){
-      for (g in 1:G){
-        r_2[[m]][,g] <- -w.mg[[m]][,g] + x.mg[m,g][[1]] %*% beta.mg[[g]][,m]
-      }
-    }
-    for (m in 1:M){
-      r_3[,m] <- -y.m[,m] + z.m[,m] + rowSums(w.mg[[m]])
-    }
-
-    s <- phi/M * t(X) %*% (c(z.m) - c(z.1))
-
-    r.norm <- l2norm(unlist(r_1)) + l2norm(unlist(r_2)) + l2norm(c(r_3))
+    r.norm <- r1 + r2 + r3
+    s <- phi * crossprod(X, (c(z.m) - z_prev))
     s.norm <- l2norm(s)
 
-    e.primal <- sqrt(n) * e.abs +
-      e.rel * max(l2norm(X%*%c(beta.g)), l2norm(c(z.m)), l2norm(y)) / sqrt(M*G)
-    e.dual <- sqrt(p) * e.abs + e.rel * l2norm(t(X) %*% c(theta.m)) / (M)
+    ## Thresholds
+    C_pri <- sqrt(n) * e.abs + e.rel * (max(l2norm(X %*% c(beta.g)), l2norm(c(z.m)), l2norm(y)) / sqrt(M * G))
+    C_dual <- sqrt(p) * e.abs + e.rel * (l2norm(crossprod(X, c(theta.m))) / (M * G))
 
-    # adapt phi
-    if ((t %% K) == 0){
-      if (r.norm/M > 10*s.norm) {
-        phi <- 2*phi
-      } else if (s.norm > 10*r.norm/M) {
-        phi <- phi/2
+    ## Adaptive phi
+    if (!freeze_phi && (t %% K) == 0 && t < 100) {
+      phi_old <- phi
+      if (r.norm > 10 * s.norm) {
+        phi <- 10 * phi
+      } else if (s.norm > 10 * r.norm) {
+        phi <- phi / 10
       }
+      if (!identical(phi, phi_old)) {
+        sc <- phi_old / phi
+        for (g in 1:G) gamma.g[[g]] <- gamma.g[[g]] * sc
+        theta.m <- theta.m * sc
+        for (m in 1:M) eta.mg[[m]] <- eta.mg[[m]] * sc
+      }
+    }
+
+    ## (7) Stopping checks
+    beta_vec <- c(beta.g)
+    F_curr <- obj_lad_l1(beta_vec)
+    if (!is.finite(F_curr)) F_curr <- F_prev
+
+    denom_b <- max(1, max(abs(beta_vec_prev)))
+    delta_beta <- max(abs(beta_vec - beta_vec_prev)) / denom_b
+    if (!is.finite(delta_beta)) delta_beta <- Inf
+
+    delta_F <- abs(F_curr - F_prev) / max(1, abs(F_prev))
+    if (!is.finite(delta_F)) delta_F <- Inf
+
+    A_curr <- support_set(beta_vec, delta = delta_support, penalize_intercept = penalize_intercept)
+    if (identical(A_curr, A_prev)) stable_ct <- stable_ct + 1L else stable_ct <- 0L
+
+    feas_ok <- isTRUE(r.norm <= C_pri && s.norm <= C_dual)
+    gate <- (t >= min_iter)
+
+    stop_now <- switch(stop_rule,
+      residual = gate && feas_ok,
+      objective = {
+        core <- (delta_F <= epsF)
+        if (residual_gated) (gate && feas_ok && core) else (gate && core)
+      },
+      beta = {
+        core <- (delta_beta <= epsBeta)
+        if (residual_gated) (gate && feas_ok && core) else (gate && core)
+      },
+      support = {
+        core <- (stable_ct >= L_support)
+        if (residual_gated) (gate && feas_ok && core) else (gate && core)
+      },
+      hybrid = {
+        core <- (delta_beta <= epsBeta)
+        (gate && feas_ok && core)
+      }
+    )
+    if (!isTRUE(stop_now)) stop_now <- FALSE
+
+    if (stop_now) {
+      stop_iter <- t
+      stop_reason <- stop_rule
+      break
+    }
+
+    beta_vec_prev <- beta_vec
+    F_prev <- F_curr
+    A_prev <- A_curr
+    t <- t + 1L
+
+    if (verbose && (t %% print_every == 0)) {
+      message("iter=", t, " r_norm=", signif(r.norm, 4), " s_norm=", signif(s.norm, 4))
     }
   }
 
-  beta <- c(beta.g)
+  if (is.na(stop_iter)) { stop_iter <- t; stop_reason <- "max_iter" }
 
-  # diagnostics (optional, only if true info provided)
-  P1 <- P2 <- FP <- FN <- err <- NA_real_
-  if (!is.null(idx_true)) {
-    P1 <- as.numeric(sum(beta[idx_true] != 0) == length(idx_true))
-    P2 <- as.numeric(beta[1] != 0)
-    FP <- sum(beta[-idx_true] != 0) / length(beta[-idx_true])
-    FN <- sum(beta[idx_true] == 0) / length(idx_true)
-  }
-  if (!is.null(beta_true)) {
-    err <- l1norm(beta - beta_true)
-  }
-
-  list(beta.hat = beta,
-       iter = t,
-       err = err,
-       P1 = P1,
-       P2 = P2,
-       FP = FP,
-       FN = FN,
-       size = sum(beta != 0))
-}
-
-#' HBIC-style score for model selection
-#' @param lamb penalty value
-#' @param X,y design and response
-#' @param K,M,G,phi,rho,tau,e.rel,e.abs,max_iter algorithm settings (subset used)
-#' @param x.ori original (un-transformed) X for n computation
-#' @return list(hbic=..., model=...)
-#' @export
-HBIC <- function(lamb, X, y, K = 1, x.ori, M = 2, G = 1,
-                 max_iter = 10, rho = 1.618, tau = 0.5,
-                 e.rel = 1e-1, e.abs = 1e-1, phi = 1/200){
-  n <- nrow(x.ori); p <- ncol(X)
-  result <- admm_both(X, y, lambda = lamb, max_iter = max_iter, rho = rho, tau = tau,
-                      e.rel = e.rel, e.abs = e.abs, phi = phi, M = M, G = G, K = K,
-                      Args = NULL)
-  residual <- abs(y - X %*% result$beta.hat)
-  df <- sum(result$beta.hat != 0)
-  BIC_cal <- log(sum(residual)) + df * log(log(n)) * log(p) / n
-  list(hbic = BIC_cal, model = result)
-}
-
-#' Multiplier-bootstrap based lambda estimator (rank-style)
-#' @param X design matrix
-#' @param alpha0 1 - confidence level
-#' @param c inflation factor
-#' @param times number of draws
-#' @export
-est_lambda <- function(X, alpha0 = 0.1, c = 1.01, times = 1e2){
-  dimn <- nrow(X)
-  res <- NULL
-  for (i in 1:times){
-    epsilon_rank <- sample(1:dimn, dimn)
-    xi <- 2*epsilon_rank - (dimn + 1)
-    S <- (-2/dimn/(dimn-1)) * (t(X) %*% xi)
-    res <- c(res, max(abs(S)))
-  }
-  as.numeric(stats::quantile(res, 1 - alpha0)) * c
+  list(
+    beta.hat = c(beta.g),
+    iter = t,
+    stop_iter = stop_iter,
+    stop_rule = stop_rule,
+    stop_reason = stop_reason,
+    r_norm = r.norm,
+    s_norm = s.norm,
+    e_pri = C_pri,
+    e_dual = C_dual,
+    feas_ok = isTRUE(r.norm <= C_pri && s.norm <= C_dual),
+    F = F_prev,
+    delta_F = delta_F,
+    delta_beta = delta_beta,
+    support_size = length(A_prev),
+    phi_final = phi,
+    trace = trace
+  )
 }

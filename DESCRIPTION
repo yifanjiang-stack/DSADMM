@@ -1,26 +1,14 @@
 Package: DSADMM
 Type: Package
-Title: Double-Splitting ADMM for Quantile Regression
-Version: 0.1.0
-Authors@R: 
-    person(given = "Yifan",
-           family = "Jiang",
-           role = c("aut", "cre"),
-           email = "yifan@example.com")
-Description: Implements helper generators for pairwise differences and an ADMM solver
-    for quantile regression with double-splitting structure. Includes BIC-style
-    lambda selection and simple AR/CS design generators.
+Title: DS-ADMM Solver and HBIC Utilities
+Version: 1.0.0
+Authors@R: person(given = "Yifan", family = "Jiang", role = c("aut", "cre"), email = "yifanjiang767@gmail.com")
+Description: Implements a block-splitting ADMM solver with multiple stopping rules and HBIC-based lambda selection.
 License: MIT + file LICENSE
 Encoding: UTF-8
-Roxygen: list(markdown = TRUE)
-RoxygenNote: 7.3.2
-Depends: R (>= 3.5.0)
-Imports:
-    MASS,
-    foreach,
-    doParallel,
-    compiler
+LazyData: true
 Suggests:
+    glmnet,
     testthat (>= 3.0.0)
 Config/testthat/edition: 3
-LazyData: true
+RoxygenNote: 7.3.3
