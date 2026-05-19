@@ -1,14 +1,24 @@
 Package: DSADMM
 Type: Package
-Title: DS-ADMM Solver and HBIC Utilities
+Title: Double-Splitting ADMM for Penalized Rank Regression
 Version: 1.0.0
-Authors@R: person(given = "Yifan", family = "Jiang", role = c("aut", "cre"), email = "yifanjiang767@gmail.com")
-Description: Implements a block-splitting ADMM solver with multiple stopping rules and HBIC-based lambda selection.
+Authors@R: c(
+    person("Yifan", "Jiang", role = c("aut", "cre"), email = "yifanjiang767@gmail.com")
+    )
+Author: Yifan Jiang [aut, cre]
+Maintainer: Yifan Jiang <yifanjiang767@gmail.com>
+Description: Implements double-splitting ADMM estimators for high-dimensional
+    rank regression with L1 and SCAD penalties. The package code is organized
+    from the rank-ADMM simulation scripts used for Example 1 / Table 1 and
+    Example 2 / Table 2, preserving their ADMM settings and HBIC tuning
+    workflow.
 License: MIT + file LICENSE
 Encoding: UTF-8
 LazyData: true
+RoxygenNote: 7.3.3
+Imports:
+    MASS
 Suggests:
     glmnet,
     testthat (>= 3.0.0)
 Config/testthat/edition: 3
-RoxygenNote: 7.3.3
