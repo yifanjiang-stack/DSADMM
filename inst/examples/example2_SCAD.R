@@ -34,7 +34,7 @@ FINAL_MAXITER_res <- 400L
 HBIC_EABS <- 1e-2
 OBJ_SCALE <- "mean"
 
-n_rep <- as.integer(Sys.getenv("DSADMM_EXAMPLE_REPS", "1"))
+n_rep <- as.integer(Sys.getenv("DSADMM_EXAMPLE_REPS", "1000"))
 seed_master <- 2021L
 seeds <- seed_master + seq_len(n_rep)
 run_competitors <- !identical(Sys.getenv("DSADMM_RUN_COMPETITORS"), "FALSE")

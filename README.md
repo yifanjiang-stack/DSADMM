@@ -16,16 +16,8 @@ updated Example 1 and Example 2 scripts:
 
 - `n = 60`, `p = 200`
 - AR(1) Gaussian design with `rho = 0.5`
-- normal error with standard deviation `1`
 - true beta has the first four entries equal to `1` and all others `0`
 - pairwise rank transformation after centering/scaling
-- `M = 2`, `G = 4`, `phi = 1 / 400`, `rho = 1.618`
-- HBIC lambda selection with `max_iter = 500`
-- final reported ADMM estimator with `max_iter = 400`
-- raw beta L1 estimation error, with no thresholding or top-K evaluation
-
-The SCAD example uses the updated damped LLA path with monotone SCAD objective
-line search, initialized from the L1 ADMM estimator.
 
 ## Running Examples
 
@@ -48,7 +40,7 @@ $env:DSADMM_RUN_COMPETITORS = "FALSE"
 To run more seeds:
 
 ```powershell
-$env:DSADMM_EXAMPLE_REPS = "10"
+$env:DSADMM_EXAMPLE_REPS = "1000"
 Rscript -e "library(DSADMM); source(system.file('examples','example1_L1.R',package='DSADMM'))"
 Rscript -e "library(DSADMM); source(system.file('examples','example2_SCAD.R',package='DSADMM'))"
 ```
