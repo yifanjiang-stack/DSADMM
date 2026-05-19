@@ -1,7 +1,8 @@
-\.Rproj$
-^\.github$
-^_pkgdown\.yml$
+^\.git$
+^\.gitignore$
 ^README\.Rmd$
-^LICENSE\.md$
-^\.DS_Store$
-^\.Rproj\.user$
+^\.\.Rcheck$
+^DSADMM_.*\.tar\.gz$
+^DSADMM\.Rcheck$
+^checks?$
+^\.github$

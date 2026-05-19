@@ -1,13 +1,32 @@
-test_that("creating_x/y sizes are correct", {
-  x <- matrix(1:9, nrow = 3)
-  y <- 1:3
-  expect_equal(nrow(creating_x(x)), 3)   # 3*2/2
-  expect_equal(ncol(creating_x(x)), ncol(x))
-  expect_equal(length(creating_y(y)), 3) # 3*2/2
+test_that("L1 and SCAD fits return finite coefficient vectors", {
+  set.seed(11)
+  beta <- c(1, 1, rep(0, 6))
+  dat <- simulate_rank_example(n = 8, p = 8, rho = 0.3,
+                               error = "normal", beta = beta)
+
+  fit_l1 <- rank_admm_fit(
+    dat$x, dat$y,
+    penalty = "L1",
+    lambda = 0.1,
+    M = 2, G = 2, phi = 1 / 50,
+    max_iter = 2,
+    rank_transform = TRUE,
+    standardize = TRUE
+  )
+  expect_length(fit_l1$beta, 8)
+  expect_true(all(is.finite(fit_l1$beta)))
+
+  fit_scad <- rank_admm_fit(
+    dat$x, dat$y,
+    penalty = "SCAD",
+    lambda = 0.1,
+    M = 2, G = 2, phi = 1 / 50,
+    max_iter = 2,
+    lla_max = 1,
+    rank_transform = TRUE,
+    standardize = TRUE
+  )
+  expect_length(fit_scad$beta, 8)
+  expect_true(all(is.finite(fit_scad$beta)))
 })
 
-test_that("AR generator returns correct dims", {
-  X <- AR(10, 5, rho = 0.3)
-  expect_true(is.matrix(X))
-  expect_equal(dim(X), c(10,5))
-})
